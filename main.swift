@@ -1,13 +1,15 @@
 // NetSpeed — live network speed for the macOS menu bar.
 //
-// Reads per-interface 64-bit counters via sysctl(NET_RT_IFLIST2) — the same
-// source `netstat` uses — and displays a wrapping-subtraction delta (correct
-// even at 4 GB counter boundaries) normalized by real elapsed time, so
-// sleep/wake never produces a bogus spike.
+// Measures the primary (internet-facing) interface only, so traffic forwarded between
+// interfaces (Internet Sharing, bridges) or tunnelled inside a VPN isn't counted twice.
+// Reads its exact 64-bit byte counters via sysctl(IFMIB_IFDATA) — the same source
+// `netstat -ib` uses — and divides the delta by elapsed monotonic time (which includes
+// sleep), so sleep/wake and clock changes never produce a bogus spike.
 
 import AppKit
 import Darwin
 import ServiceManagement
+import SystemConfiguration
 
 // MARK: - Settings (persisted)
 
@@ -15,81 +17,66 @@ enum Prefs {
     static let paused = "paused"
     static let downloadOnly = "downloadOnly"
     static let bits = "bitsMode"
-    static let loginItem = "loginItem"
 }
 
-// MARK: - Counters (sysctl NET_RT_IFLIST2, if_data64)
+// MARK: - Counters (sysctl IFMIB_IFDATA, if_data64)
 
-/// index -> (rxBytes, txBytes) for every interface
-func routeCounters() -> [Int32: (UInt64, UInt64)] {
-    var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
-    var size: size_t = 0
-    guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0, size > 0 else { return [:] }
-    var buf = [UInt8](repeating: 0, count: size)
-    var dataSize = size
-    guard sysctl(&mib, u_int(mib.count), &buf, &dataSize, nil, 0) == 0, dataSize > 0 else { return [:] }
-
-    var out: [Int32: (UInt64, UInt64)] = [:]
-    buf.withUnsafeBytes { raw in
-        var offset = 0
-        while offset < dataSize {
-            let p = raw.baseAddress!.advanced(by: offset)
-            let msglen = Int(p.load(as: UInt16.self))
-            if msglen <= 0 { break }
-            let type = p.load(fromByteOffset: 3, as: UInt8.self)
-            if type == 0x12 /* RTM_IFINFO2 */, msglen >= MemoryLayout<if_msghdr2>.size {
-                let ifm = p.assumingMemoryBound(to: if_msghdr2.self).pointee
-                out[Int32(ifm.ifm_index)] = (ifm.ifm_data.ifi_ibytes, ifm.ifm_data.ifi_obytes)
-            }
-            offset += msglen
-        }
-    }
-    return out
+/// (rxBytes, txBytes) for one interface, or nil if it doesn't exist (anymore).
+/// Not NET_RT_IFLIST2 / getifaddrs: macOS hands normal apps those counters cut to
+/// 32 bits and rounded to 1 KB, which wraps every 4 GB (~30s at 1 Gbps).
+func interfaceCounters(index: UInt32) -> (rx: UInt64, tx: UInt64)? {
+    guard index > 0 else { return nil }
+    var mib: [Int32] = [CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, Int32(index), IFDATA_GENERAL]
+    var d = ifmibdata()
+    var size = MemoryLayout<ifmibdata>.size
+    guard sysctl(&mib, u_int(mib.count), &d, &size, nil, 0) == 0 else { return nil }
+    return (d.ifmd_data.ifi_ibytes, d.ifmd_data.ifi_obytes)
 }
 
-/// index -> interface name (from getifaddrs, AF_LINK sockaddr_dl)
-func indexToName() -> [Int32: String] {
-    var map: [Int32: String] = [:]
-    var ifaddr: UnsafeMutablePointer<ifaddrs>?
-    guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return map }
-    defer { freeifaddrs(first) }
-    var ptr = first
-    while true {
-        let ifp = ptr.pointee
-        if let sa = ifp.ifa_addr, sa.pointee.sa_family == UInt8(AF_LINK), let nameC = ifp.ifa_name {
-            let sdl = UnsafeRawPointer(sa).assumingMemoryBound(to: sockaddr_dl.self).pointee
-            map[Int32(sdl.sdl_index)] = String(cString: nameC)
-        }
-        guard let next = ifp.ifa_next else { break }
-        ptr = next
+/// BSD name of the interface carrying the default route ("en0"), nil when offline.
+func primaryInterface(_ store: SCDynamicStore?) -> String? {
+    for key in ["State:/Network/Global/IPv4", "State:/Network/Global/IPv6"] {
+        if let dict = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
+           let name = dict["PrimaryInterface"] as? String { return name }
     }
-    return map
+    return nil
+}
+
+/// Seconds on a clock that never jumps and keeps running during sleep.
+func monotonicSeconds() -> Double {
+    Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9
 }
 
 // MARK: - Formatting
 
-func formatRate(bitsPerSecond bps: Double, bits: Bool) -> String {
-    let v = bps * (bits ? 8 : 1)
-    let s = bits ? "b" : ""
-    switch true {
-    case v >= 1_073_741_824: return String(format: "%.1f G%@", v / 1_073_741_824, s)
-    case v >= 1_048_576:     return String(format: "%.1f M%@", v / 1_048_576, s)
-    case v >= 1024:          return String(format: "%.0f K%@", v / 1024, s)
-    default:                 return String(format: "%.0f B%@", v, s)
-    }
+/// Fixed-width (3-char number + unit) so the menu bar item doesn't jitter.
+/// Decimal (1000) units, matching Activity Monitor and how link speeds are quoted.
+func formatRate(bytesPerSecond bps: Double, bits: Bool) -> String {
+    let units = bits ? ["b ", "Kb", "Mb", "Gb", "Tb"] : ["B", "K", "M", "G", "T"]
+    var v = max(0, bps) * (bits ? 8 : 1)
+    var u = 0
+    while v >= 999.5, u < units.count - 1 { v /= 1000; u += 1 }
+    let num = (u > 0 && v < 9.95) ? String(format: "%.1f", v) : String(format: "%.0f", v)
+    return String(repeating: " ", count: max(0, 3 - num.count)) + num + units[u]
 }
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
-    var activity: NSObjectProtocol?
+    var hiddenBecause: Set<String> = [] // screens asleep, locked, or user switched away
+    var store: SCDynamicStore?
+    var primaryIndex: UInt32 = 0
+    let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
 
-    // per-interface last-seen counters (wrapped delta math)
-    var lastRx: [String: UInt64] = [:]
-    var lastTx: [String: UInt64] = [:]
-    var lastDate = Date()
+    // last-seen counters, tagged with the interface they came from
+    var last: (index: UInt32, rx: UInt64, tx: UInt64)?
+    var lastTime = monotonicSeconds()
+    var lastDown: Double?
+    var lastUp: Double?
+    var shownText = ""
+    var shownIdle = false
 
     // menu items needing state sync
     var pauseItem: NSMenuItem!
@@ -111,33 +98,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Opt out of App Nap so the 1-second timer stays exact.
-        activity = ProcessInfo.processInfo.beginActivity(
-            options: .init(rawValue: 0x400) /* NSActivityIdleDisable: no system sleep, no timer suspension */,
-            reason: "Live menu bar network meter")
-
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-            button.title = " …"
-        }
         buildMenu()
 
-        // Warm baseline so the first tick already measures a 1s delta.
-        lastRx = [:];
-        lastTx = [:]
-        for (idx, (rx, tx)) in routeCounters() where (indexToName()[idx] ?? "").hasPrefix("en") {
-            let name = indexToName()[idx] ?? ""
-            lastRx[name] = rx
-            lastTx[name] = tx
-        }
+        // Nobody can see the menu bar while displays are off, the screen is locked,
+        // or another user is switched in: stop sampling entirely.
+        let ws = NSWorkspace.shared.notificationCenter
+        hideWhile(ws, NSWorkspace.screensDidSleepNotification, until: NSWorkspace.screensDidWakeNotification)
+        hideWhile(ws, NSWorkspace.sessionDidResignActiveNotification, until: NSWorkspace.sessionDidBecomeActiveNotification)
+        hideWhile(DistributedNotificationCenter.default(), .init("com.apple.screenIsLocked"), until: .init("com.apple.screenIsUnlocked"))
 
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.update()
+        // Re-resolve the primary interface whenever the network changes (Wi-Fi <-> Ethernet, VPN up/down).
+        var ctx = SCDynamicStoreContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+                                        retain: nil, release: nil, copyDescription: nil)
+        store = SCDynamicStoreCreate(nil, "NetSpeed" as CFString, { _, _, info in
+            Unmanaged<AppDelegate>.fromOpaque(info!).takeUnretainedValue().refreshPrimary()
+        }, &ctx)
+        if let store {
+            SCDynamicStoreSetNotificationKeys(store, ["State:/Network/Global/IPv4", "State:/Network/Global/IPv6"] as CFArray, nil)
+            CFRunLoopAddSource(CFRunLoopGetMain(), SCDynamicStoreCreateRunLoopSource(nil, store, 0), .commonModes)
         }
-        timer?.tolerance = 0.05
-        RunLoop.main.add(timer!, forMode: .common)
-        update()
+        refreshPrimary()
+        refreshRunning()
+    }
+
+    func hideWhile(_ center: NotificationCenter, _ on: Notification.Name, until off: Notification.Name) {
+        center.addObserver(forName: on, object: nil, queue: .main) { [weak self] _ in
+            self?.hiddenBecause.insert(on.rawValue); self?.refreshRunning()
+        }
+        center.addObserver(forName: off, object: nil, queue: .main) { [weak self] _ in
+            self?.hiddenBecause.remove(on.rawValue); self?.refreshRunning()
+        }
+    }
+
+    func refreshPrimary() {
+        let name = primaryInterface(store)
+        primaryIndex = name.map { if_nametoindex($0) } ?? 0
+        statusItem.button?.toolTip = name.map { "Measuring \($0)" } ?? "Offline"
+    }
+
+    /// Starts the 1s sampler when visible and not paused; otherwise stops it so the
+    /// app makes zero wakeups. (No App Nap opt-out needed: macOS doesn't nap an app whose
+    /// status item is visible — measured: 150/150 ticks on time without one.)
+    func refreshRunning() {
+        let run = !paused && hiddenBecause.isEmpty
+        // Fresh baselines on every start, so time spent stopped never shows up as a spike.
+        last = nil; lastDown = nil; lastUp = nil
+        lastTime = monotonicSeconds()
+
+        if run, timer == nil {
+            let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.update() }
+            t.tolerance = 0.1
+            RunLoop.main.add(t, forMode: .common) // .common: keep ticking while the menu is open
+            timer = t
+            update() // first tick only records the baseline
+        } else if !run {
+            timer?.invalidate(); timer = nil
+        }
+        render()
     }
 
     // MARK: menu
@@ -145,6 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func buildMenu() {
         let menu = NSMenu()
         menu.autoenablesItems = false
+        menu.delegate = self
 
         func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
             let i = NSMenuItem(title: title, action: action, keyEquivalent: key)
@@ -152,29 +171,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return i
         }
 
-        pauseItem = item(paused ? "Resume" : "Pause", #selector(togglePause(_:)), key: "p")
+        pauseItem = item("Pause", #selector(togglePause(_:)), key: "p")
         dlOnlyItem = item("Download only", #selector(toggleDownloadOnly(_:)))
         bitsItem = item("Show bits (Mbps)", #selector(toggleBits(_:)))
-        loginItem = item("Launch at Login", #selector(toggleLogin(_:)))
-        loginItem?.isHidden = true
-        if #available(macOS 13.0, *) {
-            loginItem?.isHidden = false
-        }
 
         menu.addItem(pauseItem)
         menu.addItem(dlOnlyItem)
         menu.addItem(bitsItem)
-        if let l = loginItem { menu.addItem(l) }
+        if #available(macOS 13.0, *) {
+            loginItem = item("Launch at Login", #selector(toggleLogin(_:)))
+            menu.addItem(loginItem!)
+        }
         menu.addItem(.separator())
-        menu.addItem(item("Quit NetSpeed", #selector(NSApplication.terminate(_:)), key: "q"))
+        let quit = NSMenuItem(title: "Quit NetSpeed", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
 
-        syncMenuState()
         statusItem.menu = menu
     }
 
-    func syncMenuState() {
+    // Synced on open, so a change made in System Settings > Login Items shows up too.
+    func menuWillOpen(_ menu: NSMenu) {
         pauseItem.title = paused ? "Resume" : "Pause"
-        pauseItem.state = paused ? .on : .off
         dlOnlyItem.state = downloadOnly ? .on : .off
         bitsItem.state = bitsMode ? .on : .off
         loginItem?.state = loginEnabled() ? .on : .off
@@ -183,28 +200,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: actions
 
     @objc func togglePause(_ sender: NSMenuItem) {
-        paused.toggle(); syncMenuState(); update()
+        paused.toggle(); refreshRunning()
     }
     @objc func toggleDownloadOnly(_ sender: NSMenuItem) {
-        downloadOnly.toggle(); syncMenuState(); update()
+        downloadOnly.toggle(); render()
     }
     @objc func toggleBits(_ sender: NSMenuItem) {
-        bitsMode.toggle(); syncMenuState(); update()
+        bitsMode.toggle(); render()
     }
     @objc func toggleLogin(_ sender: NSMenuItem) {
         guard #available(macOS 13.0, *) else { return }
+        let service = SMAppService.mainApp
         do {
-            if loginEnabled() {
-                try SMAppService.mainApp.unregister()
-                UserDefaults.standard.set(false, forKey: Prefs.loginItem)
-            } else {
-                try SMAppService.mainApp.register()
-                UserDefaults.standard.set(true, forKey: Prefs.loginItem)
-            }
+            if service.status == .enabled { try service.unregister() } else { try service.register() }
         } catch {
             NSLog("NetSpeed login item error: \(error)")
+            let alert = NSAlert(error: error)
+            alert.messageText = "Couldn't change Launch at Login"
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
         }
-        syncMenuState()
+        // User has to approve it in System Settings > General > Login Items.
+        if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
     }
 
     func loginEnabled() -> Bool {
@@ -215,70 +232,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: sampling
 
     func update() {
-        let now = Date()
-        let elapsed = now.timeIntervalSince(lastDate)
-        lastDate = now
+        let now = monotonicSeconds()
+        let elapsed = now - lastTime
+        lastTime = now
 
-        if paused {
-            render(idle: true)
+        let prev = last
+        last = interfaceCounters(index: primaryIndex).map { (index: primaryIndex, rx: $0.rx, tx: $0.tx) }
+        // Need the same interface as last tick, counters not gone backwards (interface reset),
+        // and a sane interval (not first tick, sleep/wake or a stall); otherwise show nothing yet.
+        guard let n = last, let o = prev, n.index == o.index, n.rx >= o.rx, n.tx >= o.tx,
+              elapsed > 0.3, elapsed < 3.0 else {
+            lastDown = nil; lastUp = nil
+            render()
             return
         }
-
-        let names = indexToName()
-        var rateRx = 0.0
-        var rateTx = 0.0
-        let cap: UInt64 = 300_000_000 // 300 MB/s — bitesize sanity bound per tick
-
-        for (idx, (rx, tx)) in routeCounters() {
-            let name = names[idx] ?? ""
-            guard name.hasPrefix("en") else { continue } // physical interfaces only: no lo0/utun/awdl/bridge double-count
-
-            var dRx: UInt64 = 0
-            var dTx: UInt64 = 0
-            if let oRx = lastRx[name] {
-                dRx = rx &- oRx
-                if dRx > cap { dRx = 0 }                        // counter reset — drop this tick
-            }
-            if let oTx = lastTx[name] {
-                dTx = tx &- oTx
-                if dTx > cap { dTx = 0 }
-            }
-            lastRx[name] = rx
-            lastTx[name] = tx
-            rateRx += Double(dRx)
-            rateTx += Double(dTx)
-        }
-
-        // Sleep/wake & stall protection: if more than 3s passed, don't display
-        // (baselines are already refreshed; next tick shows a fresh 1s value).
-        guard elapsed > 0.3, elapsed < 3.0 else {
-            render(idle: true)
-            return
-        }
-        rateRx /= elapsed
-        rateTx /= elapsed
-
-        render(down: rateRx, up: rateTx, idle: rateRx < 50 && rateTx < 50)
+        lastDown = Double(n.rx - o.rx) / elapsed
+        lastUp = Double(n.tx - o.tx) / elapsed
+        render()
     }
 
     // MARK: rendering
 
-    func render(down: Double? = nil, up: Double? = nil, idle: Bool = false) {
-        var text: String
-        if down == nil && up == nil {
-            text = paused ? "⏸" : " ↓… ↑…"
+    func render() {
+        let text: String
+        var idle = true
+        if paused {
+            text = "⏸"
+        } else if let down = lastDown, let up = lastUp {
+            let d = formatRate(bytesPerSecond: down, bits: bitsMode)
+            let u = formatRate(bytesPerSecond: up, bits: bitsMode)
+            text = downloadOnly ? "↓\(d)" : "↓\(d) ↑\(u)"
+            idle = down < 50 && up < 50
         } else {
-            let d = formatRate(bitsPerSecond: down ?? 0, bits: bitsMode)
-            let u = formatRate(bitsPerSecond: up ?? 0, bits: bitsMode)
-            text = downloadOnly ? "↓\(d)" : "↓\(d)↑\(u)"
+            text = downloadOnly ? "↓ …" : "↓ … ↑ …"
         }
 
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        let color: NSColor = idle ? NSColor.secondaryLabelColor : NSColor.labelColor
-        statusItem.button?.attributedTitle = NSAttributedString(
+        // Most ticks show the same text (e.g. idle); skip the menu bar redraw then.
+        guard text != shownText || idle != shownIdle, let button = statusItem.button else { return }
+        shownText = text
+        shownIdle = idle
+        button.attributedTitle = NSAttributedString(
             string: text,
-            attributes: [.font: font, .foregroundColor: color])
+            attributes: [.font: font, .foregroundColor: idle ? NSColor.secondaryLabelColor : NSColor.labelColor])
+        button.setAccessibilityLabel(paused ? "Network speed paused" : "Network speed \(text)")
     }
+}
+
+// `NetSpeed --selftest` checks the formatter and counter read, then exits (run by build.sh).
+if CommandLine.arguments.contains("--selftest") {
+    let cases: [(Double, Bool, String)] = [
+        (0, false, "  0B"), (999, false, "999B"), (999.6, false, "1.0K"), (9_960, false, " 10K"),
+        (123_400_000, false, "123M"), (1_250_000, true, " 10Mb"), (100, true, "800b "), (-5, false, "  0B"),
+    ]
+    for (v, bits, want) in cases {
+        let got = formatRate(bytesPerSecond: v, bits: bits)
+        precondition(got == want, "formatRate(\(v), bits: \(bits)) = '\(got)', want '\(want)'")
+    }
+    precondition(interfaceCounters(index: if_nametoindex("lo0")) != nil, "can't read lo0 counters")
+    precondition(interfaceCounters(index: 0) == nil, "index 0 must read as missing")
+    // Must work inside the App Sandbox; nil only when offline.
+    print("primary interface:", primaryInterface(nil) ?? "none (offline)")
+    print("selftest ok")
+    exit(0)
+}
+
+// Already running (e.g. launched twice)? Don't add a second menu bar item.
+if let id = Bundle.main.bundleIdentifier,
+   NSRunningApplication.runningApplications(withBundleIdentifier: id)
+       .contains(where: { $0.processIdentifier != getpid() }) {
+    exit(0)
 }
 
 let app = NSApplication.shared
