@@ -26,13 +26,52 @@ One Swift file, no dependencies, no Dock icon, ~12 MB of memory and effectively 
 
 ## Install
 
+There's no download. You build the app from this source on your own Mac, which takes about 30 seconds and one command.
+
+### 1. Install Apple's compiler (one time only)
+
+If you've never built code on this Mac, open **Terminal** and run:
+
+```bash
+xcode-select --install
+```
+
+Click **Install** in the dialog that appears (no Apple ID needed, ~1 GB). Skip this if you already have Xcode or the Command Line Tools.
+
+### 2. Download and build
+
 ```bash
 git clone https://github.com/rahul-narayanasamy/NetSpeed.git
 cd NetSpeed
 ./build.sh
 ```
 
-`build.sh` compiles the app, signs it, runs a self-test, installs it to `/Applications/NetSpeed.app`, and launches it. Run it again any time to rebuild and restart.
+No git? Click **Code → Download ZIP** on GitHub, unzip it, then in Terminal `cd` into the folder and run `./build.sh`.
+
+### 3. Done
+
+The speed appears in your menu bar (top-right of the screen). There's no window and no Dock icon; click the speed to open the menu.
+
+### What `build.sh` does
+
+1. Compiles `main.swift` into `build/NetSpeed.app`
+2. Signs it on your Mac (ad-hoc, with App Sandbox + Hardened Runtime)
+3. Runs a self-test and stops if anything is wrong
+4. Quits NetSpeed if it's running, copies the app to `/Applications/NetSpeed.app`, and opens it
+
+Nothing else on your system is touched. To update later: `git pull && ./build.sh`.
+
+Because you built it yourself, macOS doesn't show the *"unidentified developer"* warning that downloaded apps get.
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `xcrun: error: invalid active developer path` | Run step 1 (`xcode-select --install`) |
+| `Permission denied` running `./build.sh` | `chmod +x build.sh` then try again |
+| Can't write to `/Applications` | Your macOS user must be an administrator |
+| Speed not visible in the menu bar | It may be hidden behind the camera notch or by a menu bar manager (e.g. Bartender). Quit some menu bar apps or check the manager's hidden section |
+| Intel Mac | Not supported; it builds for Apple Silicon only |
 
 ### Start automatically after reboot
 
@@ -93,3 +132,7 @@ build/NetSpeed.app/Contents/MacOS/NetSpeed --selftest
 ```bash
 rm -rf /Applications/NetSpeed.app ~/Library/Containers/local.netspeed.app
 ```
+
+## License
+
+[MIT](LICENSE): free to use, modify, and share, including commercially. Just keep the copyright notice.
